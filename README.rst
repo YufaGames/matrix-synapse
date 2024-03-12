@@ -13,8 +13,11 @@ Matrix project <https://matrix.org/docs/guides/introduction>`_, and the `formal 
 <https://spec.matrix.org/>`_ describes the technical details.
 
 .. contents::
-# The new changes and guide to run the matrix server :
-## Only for the chicmic python developers
+
+=========================================================================
+The new changes and guide to run the matrix server :
+Only for the chicmic python developers
+=========================================================================
 Matrix : Go the file path /synapse/rest/client/room.py
 You will get the api with names RoomRestServlet to delete room with client admin (room admin)
 PublicRoomListRestServlet - To get public listing and register_servlets which is the routers in the matrix server

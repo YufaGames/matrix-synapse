@@ -172,22 +172,24 @@ class RoomListHandler:
         )
 
         def build_room_entry(room: LargestRoomStats) -> JsonDict:
-            entry = {
-                "room_id": room.room_id,
-                "name": room.name,
-                "topic": room.topic,
-                "canonical_alias": room.canonical_alias,
-                "num_joined_members": room.joined_members,
-                "avatar_url": room.avatar,
-                "world_readable": room.history_visibility
-                == HistoryVisibility.WORLD_READABLE,
-                "guest_can_join": room.guest_access == "can_join",
-                "join_rule": room.join_rules,
-                "room_type": room.room_type,
-            }
+            if room.topic != "" or room.topic is not None:
+                entry = {
+                    "room_id": room.room_id,
+                    "name": room.name,
+                    "topic": room.topic,
+                    "canonical_alias": room.canonical_alias,
+                    "num_joined_members": room.joined_members,
+                    "avatar_url": room.avatar,
+                    "world_readable": room.history_visibility
+                    == HistoryVisibility.WORLD_READABLE,
+                    "guest_can_join": room.guest_access == "can_join",
+                    "join_rule": room.join_rules,
+                    "room_type": room.room_type,
+                }
 
-            # Filter out Nones – rather omit the field altogether
-            return {k: v for k, v in entry.items() if v is not None}
+                # Filter out Nones – rather omit the field altogether
+                return {k: v for k, v in entry.items() if v is not None}
+            else:pass
 
         response: JsonDict = {}
         num_results = len(results)

@@ -1836,6 +1836,7 @@ class RoomShutdownHandler:
         update_result_fct: Optional[
             Callable[[Optional[JsonMapping]], Awaitable[None]]
         ] = None,
+        client_admin = False
     ) -> Optional[ShutdownRoomResponse]:
         """
         Shuts down a room. Moves all local users and room aliases automatically
@@ -1872,13 +1873,14 @@ class RoomShutdownHandler:
 
         if not RoomID.is_valid(room_id):
             raise SynapseError(400, "%s is not a legal room ID" % (room_id,))
-
-        if not await self._third_party_rules.check_can_shutdown_room(
-            requester_user_id, room_id
-        ):
-            raise SynapseError(
-                403, "Shutdown of this room is forbidden", Codes.FORBIDDEN
-            )
+        
+        if not client_admin:
+            if not await self._third_party_rules.check_can_shutdown_room(
+                requester_user_id, room_id
+            ):
+                raise SynapseError(
+                    403, "Shutdown of this room is forbidden", Codes.FORBIDDEN
+                )
 
         result = (
             result
@@ -1995,10 +1997,11 @@ class RoomShutdownHandler:
                 result["kicked_users"].append(user_id)
                 if update_result_fct:
                     await update_result_fct(result)
-            except Exception:
+            except Exception as error:
                 logger.exception(
                     "Failed to leave old room and join new room for %r", user_id
                 )
+                logger.error("Due to the issue of %s", error)
                 result["failed_to_kick_users"].append(user_id)
                 if update_result_fct:
                     await update_result_fct(result)

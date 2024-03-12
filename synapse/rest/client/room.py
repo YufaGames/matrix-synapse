@@ -18,7 +18,7 @@ import logging
 import re
 from enum import Enum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Awaitable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Awaitable, Dict, List, Optional, Tuple, cast
 from urllib import parse as urlparse
 
 from prometheus_client.core import Histogram
@@ -35,6 +35,7 @@ from synapse.api.errors import (
     ShadowBanError,
     SynapseError,
     UnredactedContentDeletedError,
+    NotFoundError
 )
 from synapse.api.filtering import Filter
 from synapse.events.utils import SerializeEventConfig, format_event_for_client_v2
@@ -64,6 +65,9 @@ from synapse.util.cancellation import cancellable
 from synapse.util.stringutils import parse_and_validate_server_name, random_string
 
 if TYPE_CHECKING:
+    from synapse.api.auth import Auth
+    from synapse.handlers.pagination import PaginationHandler
+    from synapse.handlers.room import RoomShutdownHandler
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
@@ -138,6 +142,134 @@ class TransactionRestServlet(RestServlet):
         super().__init__()
         self.txns = HttpTransactionCache(hs)
 
+class RoomRestServlet(RestServlet):
+    """Manage a room.
+
+    On DELETE : Delete a room from server.
+
+    It is a combination and improvement of shutdown and purge room.
+
+    Shuts down a room by removing all local users from the room.
+    Blocking all future invites and joins to the room is optional.
+
+    If desired any local aliases will be repointed to a new room
+    created by `new_room_user_id` and kicked users will be auto-
+    joined to the new room.
+
+    If 'purge' is true, it will remove all traces of a room from the database.
+
+    The client admin of the room can delete the room and other person will get error "You are unauthorized to perform this action",
+    Frontend needs to send two variables in payload : block-true, force_purge - True
+    """
+
+    # PATTERNS = admin_patterns("/rooms/(?P<room_id>[^/]*)$")
+
+    def __init__(self, hs: "HomeServer"):
+        self.auth = hs.get_auth()
+        self.store = hs.get_datastores().main
+        self.room_shutdown_handler = hs.get_room_shutdown_handler()
+        self.pagination_handler = hs.get_pagination_handler()
+
+    def register(self, http_server: HttpServer) -> None:
+    # /join/$room_identifier[/$txn_id]
+        PATTERNS = "/rooms/delete/(?P<room_id>[^/]*)/"
+        http_server.register_paths(
+            "DELETE",
+            client_patterns(PATTERNS, v1=True),
+            self.on_DELETE,
+            self.__class__.__name__,
+        )
+
+    async def on_DELETE(
+        self, request: SynapseRequest, room_id: str
+    ) -> Tuple[int, JsonDict]:
+        return await self._delete_room(
+            request,
+            room_id,
+            self.auth,
+            self.room_shutdown_handler,
+            self.pagination_handler,
+        )
+
+    async def _delete_room(
+        self,
+        request: SynapseRequest,
+        room_id: str,
+        auth: "Auth",
+        room_shutdown_handler: "RoomShutdownHandler",
+        pagination_handler: "PaginationHandler",
+    ) -> Tuple[int, JsonDict]:
+        requester = await auth.get_user_by_req(request)
+        ret = await self.store.get_room_with_stats(room_id)
+
+        if requester.user.to_string() != ret.creator:
+            raise SynapseError(
+                HTTPStatus.BAD_REQUEST,
+                "You are unauthorized to perform this action",
+                errcode=Codes.UNAUTHORIZED
+            )
+        
+        client_admin = True
+        # await assert_user_is_admin(auth, requester)
+
+        content = parse_json_object_from_request(request)
+        # client_admin = content.get("admin", False)
+        block = content.get("block", False)
+        if not isinstance(block, bool):
+            raise SynapseError(
+                HTTPStatus.BAD_REQUEST,
+                "Param 'block' must be a boolean, if given",
+                Codes.BAD_JSON,
+            )
+
+        purge = content.get("purge", True)
+        if not isinstance(purge, bool):
+            raise SynapseError(
+                HTTPStatus.BAD_REQUEST,
+                "Param 'purge' must be a boolean, if given",
+                Codes.BAD_JSON,
+            )
+
+        force_purge = content.get("force_purge", False)
+        if not isinstance(force_purge, bool):
+            raise SynapseError(
+                HTTPStatus.BAD_REQUEST,
+                "Param 'force_purge' must be a boolean, if given",
+                Codes.BAD_JSON,
+            )
+
+        ret = await room_shutdown_handler.shutdown_room(
+            room_id=room_id,
+            params={
+                "new_room_user_id": content.get("new_room_user_id"),
+                "new_room_name": content.get("room_name"),
+                "message": content.get("message"),
+                "requester_user_id": requester.user.to_string(),
+                "block": block,
+                "purge": purge,
+                "force_purge": force_purge,
+            },
+            client_admin = client_admin
+        )
+        
+        # Purge room
+        if purge:
+            try:
+                await pagination_handler.purge_room(room_id, force=force_purge)
+            except NotFoundError:
+                if block:
+                    # We can block unknown rooms with this endpoint, in which case
+                    # a failed purge is expected.
+                    pass
+                else:
+                    # But otherwise, we expect this purge to have succeeded.
+                    raise
+
+        # Cast safety: cast away the knowledge that this is a TypedDict.
+        # See https://github.com/python/mypy/issues/4976#issuecomment-579883622
+        # for some discussion on why this is necessary. Either way,
+        # `ret` is an opaque dictionary blob as far as the rest of the app cares.
+        return HTTPStatus.OK, cast(JsonDict, ret)
 
 class RoomCreateRestServlet(TransactionRestServlet):
     CATEGORY = "Client API requests"
@@ -170,7 +302,7 @@ class RoomCreateRestServlet(TransactionRestServlet):
         room_id, _, _ = await self._room_creation_handler.create_room(
             requester, self.get_room_config(request)
         )
-
+        print("room_id=============>",room_id)
         return 200, {"room_id": room_id}
 
     def get_room_config(self, request: Request) -> JsonDict:
@@ -245,20 +377,23 @@ class RoomStateEventRestServlet(RestServlet):
         )
 
         msg_handler = self.message_handler
+        print("msg_handler=============>",msg_handler)
         data = await msg_handler.get_room_data(
             requester=requester,
             room_id=room_id,
             event_type=event_type,
             state_key=state_key,
         )
-
+        print("data=============>",data)
         if not data:
             raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
 
         if format == "event":
             event = format_event_for_client_v2(data.get_dict())
+            print("event=============>",event)
             return 200, event
         elif format == "content":
+            print("data.get_dict()=============>",data.get_dict())
             return 200, data.get_dict()["content"]
 
         # Format must be event or content, per the parse_string call above.
@@ -273,12 +408,12 @@ class RoomStateEventRestServlet(RestServlet):
         txn_id: Optional[str] = None,
     ) -> Tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request, allow_guest=True)
-
+        print("requester=============>",requester)
         if txn_id:
             set_tag("txn_id", txn_id)
-
+        print("txn_id=============>",txn_id)
         content = parse_json_object_from_request(request)
-
+        print("content=============>",content)
         origin_server_ts = None
         if requester.app_service:
             origin_server_ts = parse_integer(request, "ts")
@@ -286,6 +421,7 @@ class RoomStateEventRestServlet(RestServlet):
         try:
             if event_type == EventTypes.Member:
                 membership = content.get("membership", None)
+                print("membership=============>",membership)
                 event_id, _ = await self.room_member_handler.update_membership(
                     requester,
                     target=UserID.from_string(state_key),
@@ -294,6 +430,7 @@ class RoomStateEventRestServlet(RestServlet):
                     content=content,
                     origin_server_ts=origin_server_ts,
                 )
+                print("event_id=============>",event_id)
             else:
                 event_dict: JsonDict = {
                     "type": event_type,
@@ -301,13 +438,14 @@ class RoomStateEventRestServlet(RestServlet):
                     "room_id": room_id,
                     "sender": requester.user.to_string(),
                 }
-
+                print("event_dict=============>",event_dict)
                 if state_key is not None:
                     event_dict["state_key"] = state_key
+                    print("state_key=============>",state_key)
 
                 if origin_server_ts is not None:
                     event_dict["origin_server_ts"] = origin_server_ts
-
+                    print("origin_server_ts=============>",origin_server_ts)
                 (
                     event,
                     _,
@@ -315,11 +453,12 @@ class RoomStateEventRestServlet(RestServlet):
                     requester, event_dict, txn_id=txn_id
                 )
                 event_id = event.event_id
+                
         except ShadowBanError:
             event_id = "$" + random_string(43)
-
         set_tag("event_id", event_id)
         ret = {"event_id": event_id}
+        print("event_id=============>",event_id)
         return 200, ret
 
 
@@ -346,19 +485,19 @@ class RoomSendEventRestServlet(TransactionRestServlet):
         txn_id: Optional[str],
     ) -> Tuple[int, JsonDict]:
         content = parse_json_object_from_request(request)
-
+        print("content:=======>", content)
         event_dict: JsonDict = {
             "type": event_type,
             "content": content,
             "room_id": room_id,
             "sender": requester.user.to_string(),
         }
-
+        
         if requester.app_service:
             origin_server_ts = parse_integer(request, "ts")
             if origin_server_ts is not None:
                 event_dict["origin_server_ts"] = origin_server_ts
-
+                print("origin_server_ts:=======>", origin_server_ts)
         try:
             (
                 event,
@@ -366,10 +505,11 @@ class RoomSendEventRestServlet(TransactionRestServlet):
             ) = await self.event_creation_handler.create_and_send_nonmember_event(
                 requester, event_dict, txn_id=txn_id
             )
+            print("event:=======>", event)
             event_id = event.event_id
         except ShadowBanError:
             event_id = "$" + random_string(43)
-
+            print("event_id:=======>", event_id)
         set_tag("event_id", event_id)
         return 200, {"event_id": event_id}
 
@@ -380,6 +520,7 @@ class RoomSendEventRestServlet(TransactionRestServlet):
         event_type: str,
     ) -> Tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request, allow_guest=True)
+        print("requester:=======>", requester)
         return await self._do(request, requester, room_id, event_type, None)
 
     async def on_PUT(
@@ -387,7 +528,7 @@ class RoomSendEventRestServlet(TransactionRestServlet):
     ) -> Tuple[int, JsonDict]:
         requester = await self.auth.get_user_by_req(request, allow_guest=True)
         set_tag("txn_id", txn_id)
-
+        print("txn_id:=======>", txn_id)
         return await self.txns.fetch_or_execute_request(
             request,
             requester,
@@ -422,7 +563,8 @@ class JoinRoomAliasServlet(ResolveRoomIdMixin, TransactionRestServlet):
         txn_id: Optional[str],
     ) -> Tuple[int, JsonDict]:
         content = parse_json_object_from_request(request, allow_empty_body=True)
-
+        print("Join Room Content")
+        print("content=============>",content)
         # twisted.web.server.Request.args is incorrectly defined as Optional[Any]
         args: Dict[bytes, List[bytes]] = request.args  # type: ignore
         remote_room_hosts = parse_strings_from_args(args, "server_name", required=False)
@@ -430,7 +572,7 @@ class JoinRoomAliasServlet(ResolveRoomIdMixin, TransactionRestServlet):
             room_identifier,
             remote_room_hosts,
         )
-
+        print("room_id, remote_room_hosts=============>",room_id, remote_room_hosts)
         await self.room_member_handler.update_membership(
             requester=requester,
             target=requester.user,
@@ -465,6 +607,12 @@ class JoinRoomAliasServlet(ResolveRoomIdMixin, TransactionRestServlet):
 
 # TODO: Needs unit testing
 class PublicRoomListRestServlet(RestServlet):
+    """
+    Go the function get_local_public_room_list and check for the build_room_entry function the changes are done there.
+
+    This api gives the public room list and for the rooms which are private for mejhool the topic is None or empty
+    So the check is marked for the same in above function
+    """
     PATTERNS = client_patterns("/publicRooms$", v1=True)
     CATEGORY = "Client API requests"
 
@@ -475,7 +623,6 @@ class PublicRoomListRestServlet(RestServlet):
 
     async def on_GET(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
         server = parse_string(request, "server")
-
         try:
             await self.auth.get_user_by_req(request, allow_guest=True)
         except InvalidClientCredentialsError as e:
@@ -530,7 +677,7 @@ class PublicRoomListRestServlet(RestServlet):
 
         limit: Optional[int] = int(content.get("limit", 100))
         since_token = content.get("since", None)
-        search_filter = content.get("filter", None)
+        search_filter = content.get("filter", "public")
 
         include_all_networks = content.get("include_all_networks", False)
         third_party_instance_id = content.get("third_party_instance_id", None)
@@ -570,7 +717,7 @@ class PublicRoomListRestServlet(RestServlet):
                 include_all_networks=include_all_networks,
                 third_party_instance_id=third_party_instance_id,
             )
-
+            print("Remote Room fetched =====>")
         else:
             data = await handler.get_local_public_room_list(
                 limit=limit,
@@ -578,6 +725,7 @@ class PublicRoomListRestServlet(RestServlet):
                 search_filter=search_filter,
                 network_tuple=network_tuple,
             )
+            print("Local Room fetched =====>")
 
         return 200, data
 
@@ -691,6 +839,8 @@ class RoomMessageListRestServlet(RestServlet):
             room_id,  # type: ignore[arg-type]
         )
 
+        time_frame = 10
+        
         requester = await self.auth.get_user_by_req(request, allow_guest=True)
         pagination_config = await PaginationConfig.from_request(
             self.store, request, default_limit=10
@@ -1117,6 +1267,7 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
         # Ensure the redacts property in the content matches the one provided in
         # the URL.
         room_version = await self._store.get_room_version(room_id)
+        print("Room's version ++++++++==============>", room_version)
         if room_version.updated_redaction_rules:
             if "redacts" in content and content["redacts"] != event_id:
                 raise SynapseError(
@@ -1126,7 +1277,7 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
                 )
             else:
                 content["redacts"] = event_id
-
+        print("Rquest Body ============>", content)
         try:
             with_relations = None
             if self._msc3912_enabled and "org.matrix.msc3912.with_relations" in content:
@@ -1136,12 +1287,13 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
             # Check if there's an existing event for this transaction now (even though
             # create_and_send_nonmember_event also does it) because, if there's one,
             # then we want to skip the call to redact_events_related_to.
+            
             event = None
             if txn_id:
                 event = await self.event_creation_handler.get_event_from_transaction(
                     requester, txn_id, room_id
                 )
-
+            print("Event ============>", event)
             # Event is not yet redacted, create a new event to redact it.
             if event is None:
                 event_dict = {
@@ -1150,6 +1302,7 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
                     "room_id": room_id,
                     "sender": requester.user.to_string(),
                 }
+                print("Evnet Dict Redaction =======================?.?>", event_dict)
                 # Earlier room versions had a top-level redacts property.
                 if not room_version.updated_redaction_rules:
                     event_dict["redacts"] = event_id
@@ -1170,7 +1323,7 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
                         initial_redaction_event=event,
                         relation_types=with_relations,
                     )
-
+            print("Event id ============>", event_id)
             event_id = event.event_id
         except ShadowBanError:
             event_id = "$" + random_string(43)
@@ -1485,6 +1638,9 @@ class RoomSummaryRestServlet(ResolveRoomIdMixin, RestServlet):
 
 
 def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
+    """
+    Register the api here with the register function like routers
+    """
     RoomStateEventRestServlet(hs).register(http_server)
     RoomMemberListRestServlet(hs).register(http_server)
     JoinedRoomMemberListRestServlet(hs).register(http_server)
@@ -1500,6 +1656,7 @@ def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
     RoomHierarchyRestServlet(hs).register(http_server)
     if hs.config.experimental.msc3266_enabled:
         RoomSummaryRestServlet(hs).register(http_server)
+    RoomRestServlet(hs).register(http_server)
     RoomEventServlet(hs).register(http_server)
     JoinedRoomsRestServlet(hs).register(http_server)
     RoomAliasListServlet(hs).register(http_server)

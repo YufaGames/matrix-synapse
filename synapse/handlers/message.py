@@ -129,11 +129,13 @@ class MessageHandler:
         ) = await self.auth.check_user_in_room_or_world_readable(
             room_id, requester, allow_departed_users=True
         )
-
+        
+        logger.info(f"The membership type of room: {membership} and membership event type: {membership_event_id} ")
         if membership == Membership.JOIN:
             data = await self._storage_controllers.state.get_current_state_event(
                 room_id, event_type, state_key
             )
+            
         elif membership == Membership.LEAVE:
             key = (event_type, state_key)
             # If the membership is not JOIN, then the event ID should exist.
@@ -644,7 +646,6 @@ class EventCreationHandler:
             Tuple of created event, Context
         """
         await self.auth_blocking.check_auth_blocking(requester=requester)
-
         if event_dict["type"] == EventTypes.Create and event_dict["state_key"] == "":
             room_version_id = event_dict["content"]["room_version"]
             maybe_room_version_obj = KNOWN_ROOM_VERSIONS.get(room_version_id)
@@ -716,11 +717,11 @@ class EventCreationHandler:
             for_batch=for_batch,
             current_state_group=current_state_group,
         )
-
+        print("event:=======>", event)
         # In an ideal world we wouldn't need the second part of this condition. However,
         # this behaviour isn't spec'd yet, meaning we should be able to deactivate this
         # behaviour. Another reason is that this code is also evaluated each time a new
-        # m.room.aliases event is created, which includes hitting a /directory route.
+        # m.room.aliases event is created, which includes hitting a  /directory route.
         # Therefore not including this condition here would render the similar one in
         # synapse.handlers.directory pointless.
         if builder.type == EventTypes.Aliases and self.require_membership_for_aliases:
@@ -984,7 +985,9 @@ class EventCreationHandler:
             ShadowBanError if the requester has been shadow-banned.
         """
 
+        print("event_dict, ratelimit, txn_id, prev_event_ids, state_event_ids:=======>", event_dict, ratelimit, txn_id, prev_event_ids, state_event_ids)
         if event_dict["type"] == EventTypes.Member:
+
             raise SynapseError(
                 500, "Tried to send member event through non-member codepath"
             )
@@ -992,10 +995,12 @@ class EventCreationHandler:
         if not ignore_shadow_ban and requester.shadow_banned:
             # We randomly sleep a bit just to annoy the requester.
             await self.clock.sleep(random.randint(1, 10))
+            
             raise ShadowBanError()
 
         if ratelimit:
             room_id = event_dict["room_id"]
+            
             try:
                 room_version = await self.store.get_room_version(room_id)
             except NotFoundError:
@@ -1075,6 +1080,7 @@ class EventCreationHandler:
             is_user_in_room = await self.store.check_local_user_in_room(
                 user_id, room_id
             )
+            print("user_id, is_user_in_room:=======>", user_id, is_user_in_room)
             if not is_user_in_room:
                 raise AuthError(403, f"User {user_id} not in room {room_id}")
 
@@ -1217,6 +1223,7 @@ class EventCreationHandler:
         # Strip down the state_event_ids to only what we need to auth the event.
         # For example, we don't need extra m.room.member that don't match event.sender
         if state_event_ids is not None:
+            print("state_events_id =========> ", state_event_ids)
             # Do a quick check to make sure that prev_event_ids is present to
             # make the type-checking around `builder.build` happy.
             # prev_event_ids could be an empty array though.
@@ -1227,11 +1234,14 @@ class EventCreationHandler:
                 auth_event_ids=state_event_ids,
                 depth=depth,
             )
+            print("temp_event =========> ", temp_event)
             state_events = await self.store.get_events_as_list(state_event_ids)
+            print("state_events =========> ", state_events)
             # Create a StateMap[str]
             current_state_ids = {
                 (e.type, e.state_key): e.event_id for e in state_events
             }
+            print("current_state_ids =========> ", current_state_ids)
             # Actually strip down and only use the necessary auth events
             auth_event_ids = self._event_auth_handler.compute_auth_events(
                 event=temp_event,
@@ -1248,10 +1258,12 @@ class EventCreationHandler:
         else:
             prev_event_ids = await self.store.get_prev_events_for_room(builder.room_id)
 
+        print("prev_event_ids =========> ", prev_event_ids)
         # Do a quick sanity check here, rather than waiting until we've created the
         # event and then try to auth it (which fails with a somewhat confusing "No
         # create event in auth events")
         if allow_no_prev_events:
+            print("builder.type =========> ", builder.type)
             # We allow events with no `prev_events` but it better have some `auth_events`
             assert (
                 builder.type == EventTypes.Create
@@ -1259,6 +1271,7 @@ class EventCreationHandler:
                 # only if it has auth_event_ids.
                 or auth_event_ids
             ), "Attempting to create a non-m.room.create event with no prev_events or auth_event_ids"
+
         else:
             # we now ought to have some prev_events (unless it's a create event).
             assert (
@@ -1288,7 +1301,6 @@ class EventCreationHandler:
                 auth_event_ids=auth_event_ids,
                 depth=depth,
             )
-
             # Pass on the outlier property from the builder to the event
             # after it is created
             if builder.internal_metadata.outlier:
@@ -1297,6 +1309,7 @@ class EventCreationHandler:
             else:
                 context = await self.state.calculate_context_info(event)
 
+        print("event =========> ", event)
         if requester:
             context.app_service = requester.app_service
 

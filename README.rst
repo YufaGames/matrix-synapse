@@ -21,6 +21,8 @@ Only for the chicmic python developers
 Matrix : Go the file path /synapse/rest/client/room.py
 You will get the api with names RoomRestServlet to delete room with client admin (room admin)
 PublicRoomListRestServlet - To get public listing and register_servlets which is the routers in the matrix server
+remove_msg.py file to delete messages older than 7 hours using cron
+
 ```Docker image build
 docker build -t matrixdotorg/synapse -f docker/Dockerfile .
 
